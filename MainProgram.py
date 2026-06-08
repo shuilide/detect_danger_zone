@@ -691,6 +691,8 @@ class MainWindow(QMainWindow):
 
     def _stop_detection(self):
         """安全停止检测线程"""
+        # 先停止报警，避免关闭视频后警报继续响
+        self.alarm._stop_alarm()
         if self.detect_thread is not None:
             self.detect_thread.stop()
             self.detect_thread.wait(3000)  # 最多等待 3 秒
