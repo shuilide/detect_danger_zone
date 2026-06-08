@@ -8,6 +8,25 @@ import winsound
 import os
 import threading
 import time
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+
+# 查找系统可用的中文字体
+def _get_chinese_font(font_size=36):
+    """获取系统中可用的中文字体路径"""
+    font_paths = [
+        "C:/Windows/Fonts/msyh.ttc",      # 微软雅黑
+        "C:/Windows/Fonts/msyhbd.ttc",    # 微软雅黑粗体
+        "C:/Windows/Fonts/simhei.ttf",    # 黑体
+        "C:/Windows/Fonts/simsun.ttc",    # 宋体
+        "C:/Windows/Fonts/simkai.ttf",    # 楷体
+    ]
+    for path in font_paths:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, font_size)
+    # 回退到默认字体（不支持中文）
+    return ImageFont.load_default()
 
 
 class AlarmSystem:
@@ -94,45 +113,68 @@ class AlarmSystem:
 
     def draw_warning(self, frame):
         """
-        在画面上绘制红色警告文字
+        在画面上绘制红色警告文字（使用 PIL 支持中文显示）
 
         参数:
-            frame: BGR 格式的 numpy 数组图像（原地修改）
+            frame: BGR 格式的 numpy 数组图像
 
         返回:
             numpy.ndarray: 绘制后的图像
         """
         h, w = frame.shape[:2]
-        text = "WARNING: 区域入侵!!"
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 1.5
-        thickness = 3
 
-        (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+        # 将 OpenCV BGR 图像转为 PIL RGB 图像
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(frame_rgb)
+        draw = ImageDraw.Draw(pil_img)
+
+        # 主标题
+        main_text = "WARNING: 危险区域人员闯入!!"
+        main_font = _get_chinese_font(40)
+
+        # 测量主标题尺寸
+        bbox = draw.textbbox((0, 0), main_text, font=main_font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+
         text_x = (w - tw) // 2
-        text_y = th + 20
+        text_y = 20
 
-        # 文字背景半透明框
-        overlay = frame.copy()
-        cv2.rectangle(
-            overlay,
-            (text_x - 15, text_y - th - 15),
-            (text_x + tw + 15, text_y + 15),
-            (0, 0, 0),
-            -1
+        # 绘制半透明背景框
+        pad = 15
+        bg_x1 = text_x - pad
+        bg_y1 = text_y - pad
+        bg_x2 = text_x + tw + pad
+        bg_y2 = text_y + th + pad
+
+        overlay = Image.new("RGBA", pil_img.size, (0, 0, 0, 0))
+        overlay_draw = ImageDraw.Draw(overlay)
+        overlay_draw.rectangle(
+            [bg_x1, bg_y1, bg_x2, bg_y2],
+            fill=(0, 0, 0, 128)
         )
-        cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+        pil_img = Image.alpha_composite(
+            pil_img.convert("RGBA"), overlay
+        ).convert("RGB")
+        draw = ImageDraw.Draw(pil_img)
 
-        # 红色警报文字
-        cv2.putText(frame, text, (text_x, text_y), font, font_scale, (0, 0, 255), thickness)
+        # 红色警告主标题
+        draw.text((text_x, text_y), main_text, font=main_font, fill=(255, 0, 0))
 
-        # 副标题：当前入侵人数
-        sub_text = f"Intrusion Detected!"
-        sub_scale = 0.8
-        sub_thickness = 2
-        (stw, sth), _ = cv2.getTextSize(sub_text, font, sub_scale, sub_thickness)
-        sub_x = (w - stw) // 2
-        sub_y = text_y + th + 30
-        cv2.putText(frame, sub_text, (sub_x, sub_y), font, sub_scale, (0, 0, 255), sub_thickness)
+        # 副标题
+        sub_text = "Intrusion Detected!"
+        sub_font = _get_chinese_font(28)
+        sub_bbox = draw.textbbox((0, 0), sub_text, font=sub_font)
+        sub_w = sub_bbox[2] - sub_bbox[0]
+        sub_h = sub_bbox[3] - sub_bbox[1]
+        sub_x = (w - sub_w) // 2
+        sub_y = text_y + th + 20
+
+        draw.text((sub_x, sub_y), sub_text, font=sub_font, fill=(255, 0, 0))
+
+        # 转回 OpenCV BGR 格式
+        frame_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        # 将结果写回原 frame
+        frame[...] = frame_bgr
 
         return frame
