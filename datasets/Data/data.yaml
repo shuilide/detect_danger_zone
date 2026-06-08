@@ -1,0 +1,12 @@
+# YOLOv8 数据集配置文件
+# 用于危险区域人员检测模型训练
+
+# 训练集和验证集图片路径（请根据实际情况修改为绝对路径）
+train: datasets/Data/images/train
+val: datasets/Data/images/val
+
+# 类别数量
+nc: 1
+
+# 类别名称
+names: ['person']

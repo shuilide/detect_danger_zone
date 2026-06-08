@@ -1,0 +1,31 @@
+# Checklist
+
+- [x] 项目目录结构完整：datasets/、Font/、models/、runs/、TestFiles/、UIProgram/、ultralytics/ 均存在
+- [x] requirements.txt 包含所有必要依赖（ultralytics、opencv-python、PyQt5、supervision、numpy、pillow）
+- [x] installPackages.py 可一键安装所有依赖
+- [x] alarm.wav 报警音频文件存在且可正常播放
+- [x] datasets/Data/data.yaml 配置文件存在且格式正确
+- [x] UIProgram/detector.py 实现 YOLOv8 检测并正确过滤非 person 类别
+- [x] UIProgram/tracker.py 实现 ByteTrack 多目标追踪并分配稳定 ID
+- [x] UIProgram/zone.py 使用 cv2.pointPolygonTest 判断点是否在多边形内
+- [x] UIProgram/alarm.py 实现红色警告显示和音频播放
+- [x] UIProgram/utils.py 包含 FPS 计算等工具函数
+- [x] MainProgram.py 可成功启动 PyQt5 图形界面
+- [x] MainProgram.py "打开视频"按钮可加载本地视频文件进行检测
+- [x] MainProgram.py "打开摄像头"按钮可打开默认摄像头进行实时检测
+- [x] MainProgram.py 再次点击视频/摄像头按钮可关闭当前输入源
+- [x] MainProgram.py "绘制区域"按钮进入鼠标绘制模式，支持至少 3 个点
+- [x] MainProgram.py "绘制完成"按钮闭合多边形并开始区域内统计
+- [x] MainProgram.py 区域内人数 ≥ 阈值时触发报警（红色警告 + 音频）
+- [x] MainProgram.py 区域内人数 < 阈值时停止报警
+- [x] MainProgram.py "显示检测框"复选框可正确控制检测框显隐
+- [x] MainProgram.py "显示标签"复选框可正确控制标签显隐
+- [x] MainProgram.py "显示追踪轨迹"复选框可正确控制轨迹显隐
+- [x] MainProgram.py 实时显示 FPS、检测时长、区域内人数、总人数
+- [x] MainProgram.py 置信度/IoU/报警阈值参数可配置
+- [x] VideoTest.py 可独立运行检测本地视频文件
+- [x] CameraTest.py 可独立运行检测摄像头画面
+- [x] imgTest.py 可对单张图片进行检测并保存结果
+- [x] train_v8.py 可正常加载数据和模型开始训练
+- [x] 所有代码注释清晰、支持 CPU 运行
+- [x] 默认使用 yolov8n.pt 轻量模型

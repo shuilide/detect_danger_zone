@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+.eggs/
+
+# Virtual Environment
+venv/
+.venv/
+env/
+.env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+
+# YOLOv8 / ultralytics
+runs/
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# datasets (训练数据，通常较大且私密)
+datasets/Data/images/
+datasets/Data/labels/
+
+# Test files (测试视频/图片通常较大)
+TestFiles/
+*.mp4
+*.avi
+*.mov
+
+# model weights
+models/
+
+# 缓存
+.yolo_cache/
+.ultralytics_cache/
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Conda
+.python-version
