@@ -215,8 +215,8 @@ datasets/Data/
 **data.yaml 配置示例：**
 
 ```yaml
-train: datasets/Data/images/train
-val: datasets/Data/images/val
+train: datasets/Data_/images/train
+val: datasets/Data_/images/val
 nc: 1
 names: ['person']
 ```

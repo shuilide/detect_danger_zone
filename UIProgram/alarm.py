@@ -32,13 +32,17 @@ def _get_chinese_font(font_size=36):
 class AlarmSystem:
     """报警系统，监控区域内人数并在超阈值时触发声光警告"""
 
-    def __init__(self, alarm_sound_path='alarm.wav'):
+    def __init__(self, alarm_sound_path='alarm.wav',
+                 warning_text="WARNING: 危险区域人员闯入!!"):
         """
         初始化报警系统
 
         参数:
             alarm_sound_path: 警报音频文件路径，默认 'alarm.wav'
+            warning_text: 报警时显示的警告文字
         """
+        self.warning_text = warning_text
+
         # 尝试多个路径查找音频文件
         self.alarm_sound_path = alarm_sound_path
         if not os.path.exists(self.alarm_sound_path):
@@ -129,7 +133,7 @@ class AlarmSystem:
         draw = ImageDraw.Draw(pil_img)
 
         # 主标题
-        main_text = "WARNING: 危险区域人员闯入!!"
+        main_text = self.warning_text
         main_font = _get_chinese_font(40)
 
         # 测量主标题尺寸

@@ -17,7 +17,7 @@ import supervision as sv
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QGroupBox, QCheckBox, QDoubleSpinBox, QSpinBox,
-    QFileDialog, QMessageBox
+    QComboBox, QFileDialog, QMessageBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap, QFont
@@ -282,7 +282,9 @@ class DetectionThread(QThread):
 
                     if self.show_bbox:
                         draw_detection(
-                            frame, bbox, track_id, 'person', conf_val, color,
+                            frame, bbox, track_id,
+                            self.detector.get_class_name(int(tracked_detections.class_id[i])),
+                            conf_val, color,
                             show_label=self.show_label
                         )
 
@@ -334,6 +336,24 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("危险区域人员闯入检测与报警系统")
         self.resize(1200, 700)
+
+        # ================================================================
+        # 检测模式配置 {模式名称: (模型路径, 类别映射)}
+        # 类别映射格式: {class_id: 'class_name'}
+        # ================================================================
+        self.DETECT_MODES = {
+            '人员检测': {
+                'model': 'models/yolov8n.pt',
+                'target_classes': {0: 'person'},
+                'warning_text': "WARNING: 危险区域人员闯入!!",
+            },
+            '无人机检测': {
+                'model': 'models/best.pt',
+                'target_classes': {0: 'person', 1: 'drone'},
+                'warning_text': "WARNING: 危险区域无人机闯入!!",
+            },
+        }
+        self.current_mode = '人员检测'    # 默认检测模式
 
         # ---- 运行状态 ----
         self.video_opened = False
@@ -398,6 +418,25 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(self.btn_finish_zone)
 
         right_layout.addWidget(btn_group)
+
+        # -- 检测模式选择 --
+        mode_group = QGroupBox("检测模式")
+        mode_layout = QVBoxLayout(mode_group)
+
+        self.cmb_mode = QComboBox()
+        self.cmb_mode.addItems(list(self.DETECT_MODES.keys()))
+        self.cmb_mode.setCurrentText(self.current_mode)
+        self.cmb_mode.currentTextChanged.connect(self._on_mode_changed)
+        mode_layout.addWidget(self.cmb_mode)
+
+        self.lbl_mode_hint = QLabel(
+            "切换模式前请先关闭当前视频源，\n否则需要手动重新打开。"
+        )
+        self.lbl_mode_hint.setWordWrap(True)
+        self.lbl_mode_hint.setStyleSheet("color: #999; font: 11px 'Microsoft YaHei';")
+        mode_layout.addWidget(self.lbl_mode_hint)
+
+        right_layout.addWidget(mode_group)
 
         # -- 参数设置组 --
         param_group = QGroupBox("参数设置")
@@ -470,10 +509,10 @@ class MainWindow(QMainWindow):
         self.lbl_duration = QLabel("检测时长: --")
         info_layout.addWidget(self.lbl_duration)
 
-        self.lbl_zone_count = QLabel("区域内人数: 0")
+        self.lbl_zone_count = QLabel("区域内目标: 0")
         info_layout.addWidget(self.lbl_zone_count)
 
-        self.lbl_total_count = QLabel("画面总人数: 0")
+        self.lbl_total_count = QLabel("检测目标总数: 0")
         info_layout.addWidget(self.lbl_total_count)
 
         right_layout.addWidget(info_group)
@@ -541,9 +580,40 @@ class MainWindow(QMainWindow):
                 width: 16px;
                 height: 16px;
             }
+            QComboBox {
+                background-color: #3c3c3c;
+                border: 1px solid #555;
+                border-radius: 3px;
+                padding: 4px 8px;
+                color: #ddd;
+                font: 13px "Microsoft YaHei";
+                min-width: 100px;
+            }
+            QComboBox:hover {
+                border-color: #777;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #3c3c3c;
+                border: 1px solid #555;
+                color: #ddd;
+                selection-background-color: #4a4a4a;
+            }
         """)
 
     # ======================== 按钮事件 ========================
+
+    def _on_mode_changed(self, mode_name):
+        """检测模式切换：释放旧检测器，更新报警文字"""
+        if mode_name == self.current_mode:
+            return
+        self.current_mode = mode_name
+        # 同步报警文字
+        self.alarm.warning_text = self.DETECT_MODES[mode_name]['warning_text']
+        # 释放旧检测器，下次 _start_detection 会创建新的
+        if self.detector is not None:
+            del self.detector
+            self.detector = None
+            print(f"[MainWindow] 检测模式已切换为: {mode_name}，模型将在下次打开视频源时加载")
 
     def _on_open_video(self):
         """打开 / 关闭视频文件"""
@@ -642,11 +712,23 @@ class MainWindow(QMainWindow):
         # 先停止旧线程
         self._stop_detection()
 
-        # 延迟初始化 YOLO 检测器（仅首次）
+        # 清空上次绘制的危险区域
+        self.zone.clear()
+
+        # 同步报警文字为当前模式的配置
+        self.alarm.warning_text = self.DETECT_MODES[self.current_mode]['warning_text']
+
+        # 延迟初始化 YOLO 检测器（根据当前选择的模式动态加载）
         if self.detector is None:
             try:
+                mode_cfg = self.DETECT_MODES[self.current_mode]
+                print(f"[MainWindow] 加载检测模式: {self.current_mode}")
+                print(f"[MainWindow]   模型路径: {mode_cfg['model']}")
+                print(f"[MainWindow]   目标类别: {mode_cfg['target_classes']}")
                 self.detector = YOLODetector(
-                    model_path='models/yolov8n.pt', device='cpu'
+                    model_path=mode_cfg['model'],
+                    device='cpu',
+                    target_classes=mode_cfg['target_classes']
                 )
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"加载 YOLO 模型失败:\n{str(e)}")
@@ -738,11 +820,14 @@ class MainWindow(QMainWindow):
         self.video_label.setCursor(Qt.ArrowCursor)
         self.video_label.setText("请打开视频或摄像头")
 
+        # 清空危险区域
+        self.zone.clear()
+
         # 重置统计显示
         self.lbl_fps.setText("FPS: --")
         self.lbl_duration.setText("检测时长: --")
-        self.lbl_zone_count.setText("区域内人数: 0")
-        self.lbl_total_count.setText("画面总人数: 0")
+        self.lbl_zone_count.setText("区域内目标: 0")
+        self.lbl_total_count.setText("检测目标总数: 0")
         self.lbl_zone_count.setStyleSheet(
             "color: #ccc; font: 13px 'Microsoft YaHei';"
         )
