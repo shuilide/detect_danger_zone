@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 import os
+import shutil
 
 
 class YOLODetector:
@@ -23,16 +24,26 @@ class YOLODetector:
         self.device = device
         resolved_path = model_path
 
-        # 如果默认路径不存在，尝试在项目根目录的 models 文件夹下查找
         if not os.path.exists(resolved_path):
+            # 计算项目根目录路径
             script_dir = os.path.dirname(os.path.abspath(__file__))
-            alt_path = os.path.normpath(os.path.join(script_dir, '..', 'models', 'yolov8n.pt'))
-            if os.path.exists(alt_path):
-                resolved_path = alt_path
+            project_root = os.path.normpath(os.path.join(script_dir, '..'))
+            root_pt = os.path.join(project_root, 'yolov8n.pt')
+
+            if os.path.exists(root_pt):
+                # 根目录已有下载的文件，复制到 models/ 目录
+                os.makedirs(os.path.dirname(os.path.abspath(resolved_path)), exist_ok=True)
+                shutil.copy2(root_pt, resolved_path)
+                print(f"[YOLODetector] 已将模型从根目录复制到 {resolved_path}")
             else:
-                # 本地文件不存在，使用模型名触发 ultralytics 自动下载
+                # 本地完全没有，触发下载
+                os.makedirs(os.path.dirname(os.path.abspath(resolved_path)), exist_ok=True)
                 print(f"[YOLODetector] 本地模型文件不存在，将从 ultralytics 自动下载 yolov8n.pt ...")
-                resolved_path = 'yolov8n.pt'
+                # ultralytics 会下载到当前工作目录，下载后移动到 models/
+                temp_model = YOLO('yolov8n.pt')
+                if os.path.exists(root_pt):
+                    shutil.move(root_pt, resolved_path)
+                    print(f"[YOLODetector] 模型已下载并保存到 {resolved_path}")
 
         self.model = YOLO(resolved_path)
         # 预热模型（首次推理较慢，提前加载）
