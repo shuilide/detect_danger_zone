@@ -28,7 +28,9 @@ class ByteTrackTracker:
         返回:
             supervision.tools.detections.Detections: 带 tracker_id 的追踪结果
         """
+        # 画面中无人 → 清空所有轨迹，不做追踪
         if detections is None or len(detections) == 0:
+            self.trails.clear()
             return detections
 
         tracked_detections = self.byte_track.update_with_detections(detections)
@@ -45,13 +47,12 @@ class ByteTrackTracker:
                 if len(self.trails[tid]) > self.max_trail_length:
                     self.trails[tid] = self.trails[tid][-self.max_trail_length:]
 
-        # 清理已不再追踪的 track_id 的轨迹
+        # 清理已不在画面中的 track_id 轨迹（无延迟立即移除）
         if tracked_detections.tracker_id is not None:
             active_ids = set(int(tid) for tid in tracked_detections.tracker_id)
             stale_ids = [tid for tid in self.trails if tid not in active_ids]
             for tid in stale_ids:
-                if len(self.trails[tid]) <= 2:
-                    del self.trails[tid]
+                del self.trails[tid]
 
         return tracked_detections
 
