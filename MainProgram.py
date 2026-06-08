@@ -32,7 +32,7 @@ from UIProgram.utils import FPSCounter, get_color, draw_detection, draw_trails, 
 class VideoLabel(QLabel):
     """自定义视频显示 QLabel，支持鼠标点击事件（用于绘制区域）"""
 
-    # 鼠标点击信号，传递相对于 QLabel 的坐标 (x, y)
+    # 鼠标点击信号，传递映射回原始帧的坐标 (x, y)
     mouse_clicked = pyqtSignal(int, int)
 
     def __init__(self, parent=None):
@@ -47,14 +47,76 @@ class VideoLabel(QLabel):
 
         # 保存最近一次显示的原始 QPixmap，用于窗口缩放时重新缩放
         self._last_pixmap = None
+        # 缩放后的实际显示区域: (x, y, width, height)，相对于 QLabel 左上角
+        self._display_rect = (0, 0, 0, 0)
+        # 缩放比例 (scale_w, scale_h)，从 QLabel 坐标 → 原始帧坐标
+        self._scale = (1.0, 1.0)
+
+    def _update_display_rect(self, scaled_pixmap):
+        """计算缩放后图像在 QLabel 内的实际显示区域和缩放比例"""
+        if scaled_pixmap is None or scaled_pixmap.isNull():
+            self._display_rect = (0, 0, 0, 0)
+            self._scale = (1.0, 1.0)
+            return
+
+        label_w = self.width()
+        label_h = self.height()
+        img_w = scaled_pixmap.width()
+        img_h = scaled_pixmap.height()
+
+        if img_w <= 0 or img_h <= 0:
+            self._display_rect = (0, 0, 0, 0)
+            self._scale = (1.0, 1.0)
+            return
+
+        # 计算居中偏移（Qt.AlignCenter 会做居中）
+        offset_x = (label_w - img_w) // 2
+        offset_y = (label_h - img_h) // 2
+
+        self._display_rect = (offset_x, offset_y, img_w, img_h)
+
+        # 计算缩放比例：缩放后像素 → 原始帧像素
+        if self._last_pixmap is not None and not self._last_pixmap.isNull():
+            orig_w = self._last_pixmap.width()
+            orig_h = self._last_pixmap.height()
+            if orig_w > 0 and orig_h > 0:
+                self._scale = (orig_w / img_w, orig_h / img_h)
+            else:
+                self._scale = (1.0, 1.0)
+        else:
+            self._scale = (1.0, 1.0)
 
     def mousePressEvent(self, event):
-        """鼠标点击事件：仅在左键点击时发射信号"""
+        """鼠标点击事件：将 QLabel 坐标映射回原始帧坐标后发射信号"""
         if event.button() == Qt.LeftButton:
             x = event.pos().x()
             y = event.pos().y()
-            self.mouse_clicked.emit(x, y)
+            # 坐标转换：QLabel 坐标 → 原始视频帧坐标
+            mapped_x, mapped_y = self._map_to_frame(x, y)
+            self.mouse_clicked.emit(mapped_x, mapped_y)
         super().mousePressEvent(event)
+
+    def _map_to_frame(self, label_x, label_y):
+        """将 QLabel 上的点击坐标映射回原始视频帧坐标"""
+        dx, dy, dw, dh = self._display_rect
+        scale_w, scale_h = self._scale
+
+        if dw <= 0 or dh <= 0:
+            return label_x, label_y
+
+        # 先减去黑边偏移，得到相对于显示区域的坐标
+        rel_x = label_x - dx
+        rel_y = label_y - dy
+
+        # 边界裁剪
+        rel_x = max(0, min(rel_x, dw))
+        rel_y = max(0, min(rel_y, dh))
+
+        # 按比例放大回原始帧坐标
+        frame_x = int(rel_x * scale_w)
+        frame_y = int(rel_y * scale_h)
+
+        return frame_x, frame_y
 
     def resizeEvent(self, event):
         """窗口大小变化时重新缩放当前显示的图像"""
@@ -63,6 +125,7 @@ class VideoLabel(QLabel):
             scaled = self._last_pixmap.scaled(
                 self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
+            self._update_display_rect(scaled)
             self.setPixmap(scaled)
 
     def display_frame(self, qt_image):
@@ -72,6 +135,7 @@ class VideoLabel(QLabel):
         scaled = pixmap.scaled(
             self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
         )
+        self._update_display_rect(scaled)
         self.setPixmap(scaled)
 
 
