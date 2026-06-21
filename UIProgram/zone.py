@@ -90,7 +90,9 @@ class DangerZone:
         if self.is_closed:
             overlay = frame.copy()
             cv2.fillPoly(overlay, [pts], color)
-            cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, frame)
+            # 使用临时变量 result 接收混合结果，避免 frame 同时作为 src 和 dst
+            result = cv2.addWeighted(overlay, 0.35, frame, 0.65, 0)
+            frame[:] = result
             cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=thickness)
         else:
             # 未闭合时逐段画线

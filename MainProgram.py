@@ -9,6 +9,15 @@
 
 import sys
 import os
+
+# ⚠️ 必须在 import cv2 / torch 之前设置，防止 OpenCV 和 PyTorch 的
+# OpenMP/MKL 线程池在 QThread 中产生竞争，导致堆栈溢出 (0xC0000409)
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import time
 import cv2
 import numpy as np
@@ -26,7 +35,9 @@ from UIProgram.detector import YOLODetector
 from UIProgram.tracker import ByteTrackTracker
 from UIProgram.zone import DangerZone
 from UIProgram.alarm import AlarmSystem
-from UIProgram.utils import FPSCounter, get_color, draw_detection, draw_trails, draw_zone_count
+from UIProgram.utils import FPSCounter, get_color, draw_detection, draw_trails, draw_zone_count, frame_to_qimage
+from UIProgram.multi_cam import MultiCamConfig, CameraWorker, MultiCamManager
+from UIProgram.alarm_aggregator import AlarmAggregator, AlarmEvent
 
 
 class VideoLabel(QLabel):
@@ -171,6 +182,13 @@ class DetectionThread(QThread):
         self.show_label = True
         self.show_trails = True
 
+        # 性能优化选项
+        self.detect_every_n_frames = 2   # 每 N 帧检测一次（1=每帧都检测）
+        self.detect_width = 640           # 检测前缩放到该宽度（None=不缩放）
+        self._cached_detections = []      # 跳帧期间的缓存检测结果
+        self._cached_tracked = None       # 跳帧期间的缓存追踪结果
+        self._cached_trails = {}          # 跳帧期间的缓存轨迹
+
     def set_source(self, source, is_camera=False):
         """设置视频源"""
         self.source = source
@@ -204,6 +222,15 @@ class DetectionThread(QThread):
         """检测线程主循环"""
         self.running = True
 
+        # ⚠️ 二次保障：限制本线程内 OpenCV / PyTorch 并行度
+        # 多线程 OpenMP 在 QThread 中会导致堆栈溢出 (0xC0000409)
+        cv2.setNumThreads(1)
+        try:
+            import torch
+            torch.set_num_threads(1)
+        except ImportError:
+            pass
+
         # ---- 打开视频源 ----
         if self.is_camera:
             cap = cv2.VideoCapture(self.source, cv2.CAP_DSHOW)
@@ -220,6 +247,7 @@ class DetectionThread(QThread):
             return
 
         frame_count = 0
+        _last_emit_time = 0.0          # 帧发送限速（防止 UI 信号队列积压）
 
         while self.running:
             ret, frame = cap.read()
@@ -228,27 +256,53 @@ class DetectionThread(QThread):
 
             frame_count += 1
 
-            # ========== 1. 目标检测 ==========
-            detections_list = self.detector.detect(
-                frame,
-                conf_thres=self.conf_thres,
-                iou_thres=self.iou_thres
-            )
+            # ========== 1. 目标检测（跳帧优化） ==========
+            if frame_count % self.detect_every_n_frames == 1 or self.detect_every_n_frames <= 1:
+                # 缩放帧以加速推理（小分辨率 → 更快）
+                if self.detect_width and frame.shape[1] > self.detect_width:
+                    h, w = frame.shape[:2]
+                    scale = self.detect_width / w
+                    detect_frame = cv2.resize(frame, (self.detect_width, int(h * scale)))
+                else:
+                    detect_frame = frame
+                    scale = 1.0
 
-            # 转为 supervision Detections 格式
-            if detections_list:
-                xyxy = np.array([d['bbox'] for d in detections_list], dtype=np.float32)
-                conf = np.array([d['confidence'] for d in detections_list], dtype=np.float32)
-                cls = np.array([d['class_id'] for d in detections_list], dtype=np.int64)
-                sv_detections = sv.Detections(xyxy=xyxy, confidence=conf, class_id=cls)
+                detections_list = self.detector.detect(
+                    detect_frame,
+                    conf_thres=self.conf_thres,
+                    iou_thres=self.iou_thres
+                )
+
+                # 将检测框坐标从缩放帧映射回原始帧
+                if scale != 1.0:
+                    for d in detections_list:
+                        x1, y1, x2, y2 = d['bbox']
+                        d['bbox'] = (int(x1 / scale), int(y1 / scale),
+                                     int(x2 / scale), int(y2 / scale))
+
+                # 转为 supervision Detections 格式
+                if detections_list:
+                    xyxy = np.array([d['bbox'] for d in detections_list], dtype=np.float32)
+                    conf = np.array([d['confidence'] for d in detections_list], dtype=np.float32)
+                    cls = np.array([d['class_id'] for d in detections_list], dtype=np.int64)
+                    sv_detections = sv.Detections(xyxy=xyxy, confidence=conf, class_id=cls)
+                else:
+                    sv_detections = sv.Detections.empty()
+
+                # ========== 2. 多目标追踪 ==========
+                tracked_detections = self.tracker.update(sv_detections)
+                trails = self.tracker.get_trails()
+
+                # 缓存结果供跳帧使用
+                self._cached_detections = detections_list
+                self._cached_tracked = tracked_detections
+                self._cached_trails = trails
             else:
-                sv_detections = sv.Detections.empty()
+                # 跳过检测：复用上一帧的检测和追踪结果
+                tracked_detections = self._cached_tracked
+                trails = self._cached_trails
 
-            total_count = len(sv_detections)
-
-            # ========== 2. 多目标追踪 ==========
-            tracked_detections = self.tracker.update(sv_detections)
-            trails = self.tracker.get_trails()
+            total_count = len(self._cached_detections) if self._cached_detections else 0
 
             # ========== 3. 区域判断 ==========
             zone_count = 0
@@ -289,7 +343,8 @@ class DetectionThread(QThread):
                         )
 
             # ========== 6. 绘制轨迹 ==========
-            draw_trails(frame, trails, show_trails=self.show_trails)
+            if trails:
+                draw_trails(frame, trails, show_trails=self.show_trails)
 
             # ========== 7. 绘制区域多边形 ==========
             self.zone.draw_zone(frame)
@@ -316,13 +371,12 @@ class DetectionThread(QThread):
 
             self.update_stats_signal.emit(fps, duration_str, zone_count, total_count)
 
-            # ========== 11. 帧转为 QImage 发送到主线程 ==========
-            h, w, ch = frame.shape
-            bytes_per_line = ch * w
-            # copy() 确保数据独立，避免被后续帧覆盖
-            qt_image = QImage(frame.data, w, h, bytes_per_line,
-                              QImage.Format_BGR888).copy()
-            self.update_frame_signal.emit(qt_image)
+            # ========== 11. 帧转为 QImage 发送到主线程（限速，防止队列积压） ==========
+            now = time.time()
+            if now - _last_emit_time >= 0.033:  # 最多 30 FPS 显示
+                qt_image = frame_to_qimage(frame)
+                self.update_frame_signal.emit(qt_image)
+                _last_emit_time = now
 
         # 清理
         cap.release()
@@ -838,8 +892,470 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
+# ======================================================================
+# 多摄像头模式窗口
+# ======================================================================
+
+class MultiCamWindow(QMainWindow):
+    """多摄像头多视频联动主窗口"""
+
+    def __init__(self, config_path: str):
+        super().__init__()
+        self.setWindowTitle("多摄像头联动检测系统 - MultiCam")
+        self.resize(1400, 800)
+
+        # ---- 加载配置 ----
+        self._config = MultiCamConfig(config_path)
+        self._camera_ids = self._config.camera_ids
+
+        # ---- 运行状态 ----
+        self._running = False
+        self._active_camera_id: str = self._camera_ids[0] if self._camera_ids else ""
+        self._drawing_mode = False
+
+        # ---- 多路管理器 ----
+        self._manager = MultiCamManager(self._config)
+
+        # ---- 告警聚合器 ----
+        self._alarm_aggregator = AlarmAggregator(
+            dedup_window_seconds=self._config.global_config.alarm_dedup_window_seconds
+        )
+        self._alarm_aggregator.new_alarm.connect(self._on_new_alarm)
+
+        # ---- 视频标签缓存 ----
+        self._video_labels: dict = {}       # camera_id → VideoLabel
+
+        # ---- 界面 ----
+        self._init_ui()
+        self._apply_style()
+
+    # ==================== UI 初始化 ====================
+
+    def _init_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(10)
+
+        # ----- 左侧：视频网格区域 -----
+        self._grid_widget = QWidget()
+        self._grid_layout = None  # 由 _build_grid 动态创建
+        self._build_video_grid()
+        main_layout.addWidget(self._grid_widget, stretch=3)
+
+        # ----- 右侧：控制面板 -----
+        right_panel = QWidget()
+        right_panel.setFixedWidth(280)
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(5, 5, 5, 5)
+        right_layout.setSpacing(10)
+
+        # -- 摄像头选择 --
+        cam_group = QGroupBox("当前摄像头")
+        cam_layout = QVBoxLayout(cam_group)
+        self._cmb_camera = QComboBox()
+        self._cmb_camera.addItems(self._camera_ids)
+        self._cmb_camera.currentTextChanged.connect(self._on_active_camera_changed)
+        cam_layout.addWidget(self._cmb_camera)
+        right_layout.addWidget(cam_group)
+
+        # -- 操作按钮 --
+        btn_group = QGroupBox("操作控制")
+        btn_layout = QVBoxLayout(btn_group)
+
+        self._btn_start = QPushButton("▶ 启动全部")
+        self._btn_start.clicked.connect(self._on_start_all)
+        btn_layout.addWidget(self._btn_start)
+
+        self._btn_stop = QPushButton("⏹ 停止全部")
+        self._btn_stop.setEnabled(False)
+        self._btn_stop.clicked.connect(self._on_stop_all)
+        btn_layout.addWidget(self._btn_stop)
+
+        self._btn_draw_zone = QPushButton("✏️ 绘制区域")
+        self._btn_draw_zone.setEnabled(False)
+        self._btn_draw_zone.clicked.connect(self._on_draw_zone)
+        btn_layout.addWidget(self._btn_draw_zone)
+
+        self._btn_finish_zone = QPushButton("✅ 绘制完成")
+        self._btn_finish_zone.setEnabled(False)
+        self._btn_finish_zone.clicked.connect(self._on_finish_zone)
+        btn_layout.addWidget(self._btn_finish_zone)
+
+        right_layout.addWidget(btn_group)
+
+        # -- 参数设置 --
+        param_group = QGroupBox("参数设置（当前选中摄像头）")
+        param_layout = QVBoxLayout(param_group)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("置信度:"))
+        self._conf_spin = QDoubleSpinBox()
+        self._conf_spin.setRange(0.1, 1.0)
+        self._conf_spin.setSingleStep(0.05)
+        self._conf_spin.setDecimals(2)
+        self._conf_spin.setValue(0.5)
+        self._conf_spin.valueChanged.connect(self._on_params_changed)
+        row1.addWidget(self._conf_spin)
+        param_layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("IoU:"))
+        self._iou_spin = QDoubleSpinBox()
+        self._iou_spin.setRange(0.1, 1.0)
+        self._iou_spin.setSingleStep(0.05)
+        self._iou_spin.setDecimals(2)
+        self._iou_spin.setValue(0.5)
+        self._iou_spin.valueChanged.connect(self._on_params_changed)
+        row2.addWidget(self._iou_spin)
+        param_layout.addLayout(row2)
+
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("报警阈值:"))
+        self._alarm_spin = QSpinBox()
+        self._alarm_spin.setRange(1, 100)
+        self._alarm_spin.setValue(1)
+        self._alarm_spin.valueChanged.connect(self._on_params_changed)
+        row3.addWidget(self._alarm_spin)
+        param_layout.addLayout(row3)
+
+        right_layout.addWidget(param_group)
+
+        # -- 显示选项 --
+        display_group = QGroupBox("显示选项")
+        display_layout = QVBoxLayout(display_group)
+
+        self._chk_bbox = QCheckBox("显示检测框")
+        self._chk_bbox.setChecked(True)
+        self._chk_bbox.stateChanged.connect(self._on_display_changed)
+        display_layout.addWidget(self._chk_bbox)
+
+        self._chk_label = QCheckBox("显示标签")
+        self._chk_label.setChecked(True)
+        self._chk_label.stateChanged.connect(self._on_display_changed)
+        display_layout.addWidget(self._chk_label)
+
+        self._chk_trails = QCheckBox("显示追踪轨迹")
+        self._chk_trails.setChecked(True)
+        self._chk_trails.stateChanged.connect(self._on_display_changed)
+        display_layout.addWidget(self._chk_trails)
+
+        right_layout.addWidget(display_group)
+
+        # -- 状态信息 --
+        info_group = QGroupBox("检测信息")
+        info_layout = QVBoxLayout(info_group)
+        self._lbl_status = QLabel('就绪 — 请点击「启动全部」')
+        self._lbl_status.setWordWrap(True)
+        info_layout.addWidget(self._lbl_status)
+        right_layout.addWidget(info_group)
+
+        right_layout.addStretch()
+        main_layout.addWidget(right_panel)
+
+    def _build_video_grid(self):
+        """根据摄像头数量动态构建网格布局"""
+        if self._grid_layout is not None:
+            # 清除旧布局
+            while self._grid_layout.count():
+                item = self._grid_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+
+        from PyQt5.QtWidgets import QGridLayout
+        n = len(self._camera_ids)
+        if n == 0:
+            return
+
+        # 计算行列数
+        if n <= 2:
+            rows, cols = 1, n
+        elif n <= 4:
+            rows, cols = 2, 2
+        elif n <= 6:
+            rows, cols = 2, 3
+        else:
+            rows, cols = 3, 3
+
+        self._grid_layout = QGridLayout(self._grid_widget)
+        self._grid_layout.setContentsMargins(0, 0, 0, 0)
+        self._grid_layout.setSpacing(4)
+
+        # 均分列宽和行高，确保所有视频框大小一致
+        for c in range(cols):
+            self._grid_layout.setColumnStretch(c, 1)
+        for r in range(rows):
+            self._grid_layout.setRowStretch(r, 1)
+
+        self._video_labels.clear()
+        for idx, cam_id in enumerate(self._camera_ids):
+            label = VideoLabel()
+            label.setMinimumSize(320, 240)
+            label.mouse_clicked.connect(self._make_click_handler(cam_id))
+            r, c = divmod(idx, cols)
+            self._grid_layout.addWidget(label, r, c)
+            self._video_labels[cam_id] = label
+
+    def _make_click_handler(self, camera_id: str):
+        """为每个 VideoLabel 创建绑定了 camera_id 的点击处理器"""
+        def handler(x, y):
+            self._on_video_clicked(camera_id, x, y)
+        return handler
+
+    # ==================== 按钮/控件事件 ====================
+
+    def _on_active_camera_changed(self, cam_id: str):
+        self._active_camera_id = cam_id
+        # 同步参数控件的值为当前选中摄像头的值
+        worker = self._manager.get_worker(cam_id)
+        if worker is not None:
+            self._conf_spin.blockSignals(True)
+            self._iou_spin.blockSignals(True)
+            self._alarm_spin.blockSignals(True)
+            self._conf_spin.setValue(worker.conf_thres)
+            self._iou_spin.setValue(worker.iou_thres)
+            self._alarm_spin.setValue(worker.alarm_threshold)
+            self._conf_spin.blockSignals(False)
+            self._iou_spin.blockSignals(False)
+            self._alarm_spin.blockSignals(False)
+
+    def _on_start_all(self):
+        """启动所有摄像头"""
+        self._running = True
+        self._btn_start.setEnabled(False)
+        self._btn_stop.setEnabled(True)
+        self._btn_draw_zone.setEnabled(True)
+
+        # 启动所有 worker
+        self._manager.start_all()
+
+        # 连接每个 worker 的信号
+        for cam_id, worker in self._manager.get_all_workers().items():
+            video_label = self._video_labels.get(cam_id)
+            if video_label:
+                worker.update_frame.connect(self._make_frame_handler(cam_id))
+                worker.update_stats.connect(self._on_stats_received)
+                worker.alarm_event.connect(self._on_raw_alarm)
+                worker.video_finished.connect(self._on_video_finished)
+
+            # 设置显示选项
+            worker.set_display_options(
+                self._chk_bbox.isChecked(),
+                self._chk_label.isChecked(),
+                self._chk_trails.isChecked()
+            )
+
+        self._manager.all_finished.connect(self._on_all_finished)
+        self._lbl_status.setText(f"运行中 — {self._manager.worker_count} 路视频")
+
+    def _on_stop_all(self):
+        """停止所有摄像头"""
+        self._running = False
+        self._alarm_aggregator.reset()
+        self._manager.stop_all()
+        self._reset_ui()
+
+    def _on_draw_zone(self):
+        cam_id = self._active_camera_id
+        zone = self._manager.get_zone(cam_id)
+        if zone is None:
+            return
+        self._drawing_mode = True
+        zone.clear()
+        self._btn_draw_zone.setEnabled(False)
+        self._btn_finish_zone.setEnabled(False)
+        label = self._video_labels.get(cam_id)
+        if label:
+            label.setCursor(Qt.CrossCursor)
+
+    def _on_finish_zone(self):
+        cam_id = self._active_camera_id
+        zone = self._manager.get_zone(cam_id)
+        if zone is None or not zone.is_ready():
+            QMessageBox.warning(self, "提示", "至少需要 3 个顶点才能闭合多边形！")
+            return
+        zone.close()
+        self._drawing_mode = False
+        self._btn_draw_zone.setEnabled(True)
+        self._btn_finish_zone.setEnabled(False)
+        label = self._video_labels.get(cam_id)
+        if label:
+            label.setCursor(Qt.ArrowCursor)
+
+    def _on_video_clicked(self, camera_id: str, x: int, y: int):
+        if not self._drawing_mode:
+            return
+        if camera_id != self._active_camera_id:
+            return
+        zone = self._manager.get_zone(camera_id)
+        if zone is None:
+            return
+        zone.add_point(x, y)
+        if zone.is_ready():
+            self._btn_finish_zone.setEnabled(True)
+
+    # ==================== 参数 / 显示变更 ====================
+
+    def _on_params_changed(self):
+        cam_id = self._active_camera_id
+        worker = self._manager.get_worker(cam_id)
+        if worker is not None and worker.isRunning():
+            worker.set_params(
+                self._conf_spin.value(),
+                self._iou_spin.value(),
+                self._alarm_spin.value()
+            )
+
+    def _on_display_changed(self):
+        for worker in self._manager.get_all_workers().values():
+            if worker.isRunning():
+                worker.set_display_options(
+                    self._chk_bbox.isChecked(),
+                    self._chk_label.isChecked(),
+                    self._chk_trails.isChecked()
+                )
+
+    # ==================== 信号处理 ====================
+
+    def _make_frame_handler(self, camera_id: str):
+        """为每路视频创建帧显示回调"""
+        def handle(cam_id, qt_image):
+            label = self._video_labels.get(cam_id)
+            if label:
+                label.display_frame(qt_image)
+        return handle
+
+    def _on_stats_received(self, camera_id: str, stats: dict):
+        if camera_id == self._active_camera_id:
+            fps = stats.get('fps', 0)
+            dur = stats.get('duration', '--')
+            zc = stats.get('zone_count', 0)
+            tc = stats.get('total_count', 0)
+            alarming = stats.get('is_alarming', False)
+            dt = stats.get('detect_time_ms', 0)
+            gs = stats.get('gallery_size', 0)
+
+            status_text = (
+                f"Cam: {camera_id}\n"
+                f"FPS: {fps:.1f} | 检测: {dt:.0f}ms\n"
+                f"区域内: {zc} | 总人数: {tc}\n"
+                f"全局库: {gs} 人 | 时长: {dur}"
+            )
+            if alarming:
+                status_text += "\n⚠ 报警中!"
+                self._lbl_status.setStyleSheet(
+                    "color: red; font-weight: bold; font: 13px 'Microsoft YaHei';"
+                )
+            else:
+                self._lbl_status.setStyleSheet(
+                    "color: #ccc; font: 13px 'Microsoft YaHei';"
+                )
+            self._lbl_status.setText(status_text)
+
+    def _on_raw_alarm(self, camera_id: str, alarm_data: dict):
+        """原始告警事件 → 送入聚合器去重"""
+        event = self._alarm_aggregator.process(
+            camera_id=camera_id,
+            global_person_ids=alarm_data.get('global_person_ids', []),
+            zone_count=alarm_data.get('zone_count', 0),
+            threshold=alarm_data.get('threshold', 1),
+            timestamp=alarm_data.get('timestamp'),
+        )
+        # event 为 None 表示被去重或持续告警
+
+    def _on_new_alarm(self, event: AlarmEvent):
+        """去重后的新告警事件"""
+        cam_list = ', '.join(event.merged_from) if event.is_merged else event.camera_id
+        gid_list = ', '.join(f'#{gid}' for gid in event.global_person_ids)
+        print(f"[MultiCam] ⚠ 新告警: 人员 {gid_list} 闯入 "
+              f"摄像头 [{cam_list}] 区域 "
+              f"(区域内 {event.zone_count} 人, 阈值 {event.threshold})")
+
+    def _on_video_finished(self, camera_id: str):
+        label = self._video_labels.get(camera_id)
+        if label:
+            label.setText(f"[{camera_id}] 播放结束")
+
+    def _on_all_finished(self):
+        self._lbl_status.setText("全部视频播放完毕")
+        self._btn_stop.setEnabled(False)
+        self._btn_start.setEnabled(True)
+        self._btn_draw_zone.setEnabled(False)
+
+    # ==================== 辅助方法 ====================
+
+    def _reset_ui(self):
+        self._btn_start.setEnabled(True)
+        self._btn_stop.setEnabled(False)
+        self._btn_draw_zone.setEnabled(False)
+        self._btn_finish_zone.setEnabled(False)
+        self._drawing_mode = False
+        self._lbl_status.setText("已停止")
+        self._lbl_status.setStyleSheet("color: #ccc; font: 13px 'Microsoft YaHei';")
+        for label in self._video_labels.values():
+            label.setText("等待启动...")
+            label.setCursor(Qt.ArrowCursor)
+
+    def _apply_style(self):
+        self.setStyleSheet("""
+            QMainWindow { background-color: #2b2b2b; }
+            QGroupBox {
+                border: 1px solid #555; border-radius: 5px;
+                margin-top: 10px; padding-top: 10px;
+                color: #ddd; font-weight: bold;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin; left: 10px; padding: 0 5px;
+            }
+            QPushButton {
+                background-color: #3c3c3c; border: 1px solid #555;
+                border-radius: 4px; padding: 6px 12px;
+                color: #ddd; font: 13px "Microsoft YaHei"; min-height: 24px;
+            }
+            QPushButton:hover { background-color: #4a4a4a; }
+            QPushButton:pressed { background-color: #2a2a2a; }
+            QPushButton:disabled { background-color: #333; color: #666; }
+            QLabel { color: #ccc; font: 13px "Microsoft YaHei"; }
+            QDoubleSpinBox, QSpinBox {
+                background-color: #3c3c3c; border: 1px solid #555;
+                border-radius: 3px; padding: 2px 4px;
+                color: #ddd; font: 12px "Microsoft YaHei"; min-width: 70px;
+            }
+            QCheckBox { color: #ccc; font: 13px "Microsoft YaHei"; }
+            QCheckBox::indicator { width: 16px; height: 16px; }
+            QComboBox {
+                background-color: #3c3c3c; border: 1px solid #555;
+                border-radius: 3px; padding: 4px 8px;
+                color: #ddd; font: 13px "Microsoft YaHei"; min-width: 100px;
+            }
+            QComboBox:hover { border-color: #777; }
+            QComboBox QAbstractItemView {
+                background-color: #3c3c3c; border: 1px solid #555;
+                color: #ddd; selection-background-color: #4a4a4a;
+            }
+        """)
+
+    def closeEvent(self, event):
+        self._manager.cleanup()
+        event.accept()
+
+
 def main():
-    """程序入口"""
+    """程序入口
+
+    python MainProgram.py                        # 单路模式（原 GUI）
+    python MainProgram.py --config config/multi_cam.yaml   # 多路联动模式
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(description="危险区域检测系统")
+    parser.add_argument(
+        '--config', type=str, default=None,
+        help='多摄像头配置文件路径（YAML），不提供则使用单路模式'
+    )
+    args = parser.parse_args()
+
     # 自适应高 DPI 显示
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
@@ -847,7 +1363,16 @@ def main():
     app = QApplication(sys.argv)
     app.setFont(QFont("Microsoft YaHei", 9))
 
-    window = MainWindow()
+    if args.config:
+        if not os.path.exists(args.config):
+            print(f"[Error] 配置文件不存在: {args.config}")
+            sys.exit(1)
+        print(f"[Main] 多摄像头联动模式，配置: {args.config}")
+        window = MultiCamWindow(args.config)
+    else:
+        print("[Main] 单路检测模式")
+        window = MainWindow()
+
     window.show()
     sys.exit(app.exec_())
 

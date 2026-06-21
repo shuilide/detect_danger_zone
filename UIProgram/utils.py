@@ -6,6 +6,7 @@
 import cv2
 import time
 import numpy as np
+from PyQt5.QtGui import QImage
 
 
 class FPSCounter:
@@ -153,3 +154,20 @@ def draw_zone_count(frame, count, zone=None):
 
     cv2.putText(frame, text, (10, h - 20), font, font_scale, color, thickness)
     return frame
+
+
+def frame_to_qimage(frame):
+    """将 OpenCV BGR 帧安全转换为 QImage
+
+    使用 BGR→RGB 转换 + QImage.Format_RGB888（Qt 4.0 起支持，比 BGR888 更兼容），
+    并通过 tobytes() 让 QImage 持有独立数据副本，不依赖 numpy 缓冲区指针。
+    避免旧版 PyQt5 中 Format_BGR888 不被识别导致的堆栈溢出 (0xC0000409)。
+    """
+    # 确保 C 连续内存
+    if not frame.flags['C_CONTIGUOUS']:
+        frame = np.ascontiguousarray(frame)
+    h, w, ch = frame.shape
+    # BGR → RGB（OpenCV 默认 BGR，QImage 用 RGB）
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    # 使用 tobytes() 让 QImage 拥有独立数据副本
+    return QImage(rgb.tobytes(), w, h, w * ch, QImage.Format_RGB888)

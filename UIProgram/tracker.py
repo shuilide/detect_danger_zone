@@ -14,8 +14,31 @@ class ByteTrackTracker:
     def __init__(self):
         """初始化 ByteTrack 追踪器"""
         self.byte_track = sv.ByteTrack()
-        self.trails = defaultdict(list)       # track_id -> [(cx, cy), ...]
-        self.max_trail_length = 30            # 每个轨迹最多保留的坐标点数
+        self.trails = defaultdict(list)         # local_tracker_id -> [(cx, cy), ...]
+        self.max_trail_length = 30              # 每个轨迹最多保留的坐标点数
+        self._global_id_map: dict = {}          # local_tracker_id → global_id
+
+    def set_global_ids(self, mapping: dict):
+        """
+        注入全局 ID 映射（由跨镜匹配模块调用）
+
+        参数:
+            mapping: {local_tracker_id: global_id, ...}
+        """
+        self._global_id_map.update(mapping)
+
+    def get_global_id(self, local_tracker_id: int) -> int:
+        """
+        获取指定 local_id 对应的 global_id
+
+        返回:
+            int: global_id，若未映射则返回 local_id 本身
+        """
+        return self._global_id_map.get(local_tracker_id, local_tracker_id)
+
+    def get_display_id(self, local_tracker_id: int) -> int:
+        """获取用于显示的 ID（优先 global_id）"""
+        return self._global_id_map.get(local_tracker_id, local_tracker_id)
 
     def update(self, detections):
         """
@@ -69,3 +92,4 @@ class ByteTrackTracker:
         """重置追踪器状态，清除所有轨迹"""
         self.byte_track = sv.ByteTrack()
         self.trails.clear()
+        self._global_id_map.clear()

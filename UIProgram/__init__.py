@@ -1,7 +1,7 @@
 # coding: utf-8
 """
 UIProgram 核心模块包
-提供目标检测、追踪、区域管理和报警功能
+提供目标检测、追踪、区域管理、报警、多路管理、ReID 功能
 """
 from .detector import YOLODetector
 from .tracker import ByteTrackTracker

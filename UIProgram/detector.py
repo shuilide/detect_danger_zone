@@ -5,13 +5,20 @@ YOLOv8 目标检测器模块
 """
 import cv2
 import numpy as np
+import threading
 from ultralytics import YOLO
 import os
 import shutil
 
 
 class YOLODetector:
-    """YOLOv8 检测器封装类，支持多类别检测（person、drone 等）"""
+    """YOLOv8 检测器封装类，支持多类别检测（person、drone 等）
+
+    注意：所有实例共享一个类级别 _inference_lock，确保多线程（多路视频）
+    不会同时在 PyTorch C++ 后端中执行推理，防止 MKL/oneDNN 堆栈溢出。
+    """
+
+    _inference_lock = threading.Lock()
 
     # COCO 数据集原始类别名称（前 80 类），用于预训练模型的类别映射
     COCO_CLASSES = {
@@ -111,14 +118,15 @@ class YOLODetector:
         if frame is None or frame.size == 0:
             return []
 
-        # 执行推理
-        results = self.model(
-            frame,
-            conf=conf_thres,
-            iou=iou_thres,
-            device=self.device,
-            verbose=False
-        )
+        # 执行推理（加锁，防止多路并发推理导致 C++ 堆栈溢出）
+        with YOLODetector._inference_lock:
+            results = self.model(
+                frame,
+                conf=conf_thres,
+                iou=iou_thres,
+                device=self.device,
+                verbose=False
+            )
 
         detections_list = []
         for result in results:
